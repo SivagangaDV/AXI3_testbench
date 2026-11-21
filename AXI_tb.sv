@@ -102,7 +102,7 @@ module axi_tb_top;
             .AXI_SIZE_WIDTH (SIZE_WIDTH)
         ))::set(null, "*", "vif", vif);
 
-        run_test();
+        run_test(); ///add testname to run
     end
 
     // -------------------------------------------------------------------------
