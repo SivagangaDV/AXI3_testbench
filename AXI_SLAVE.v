@@ -74,7 +74,7 @@ module AXI_SLAVE #(
 
     localparam STRB_WIDTH    = AXI_DATA_WIDTH / 8;
     localparam BYTE_OFFSET   = clog2(STRB_WIDTH);
-    
+
     // Valid Address Space: 0x0000 to 0x7FFF (32 KB mapped RAM)
     // Any address >= 0x8000 generates DECERR
     localparam VALID_ADDR_LIMIT = 16'h7FFF;
@@ -94,7 +94,8 @@ module AXI_SLAVE #(
     localparam BURST_WRAP     = 2'b10;
     localparam BURST_RESERVED = 2'b11;
 
-    localparam NUM_IDS = (1 << AXI_ID_WIDTH);
+    localparam NUM_IDS      = (1 << AXI_ID_WIDTH);
+    localparam PRE_W_DEPTH  = 16; // Max AXI3 burst length is 16 beats
 
     // -------------------------------------------------------------------------
     // Dual-Port RAM with Byte-Write Enable (32KB)
@@ -111,6 +112,14 @@ module AXI_SLAVE #(
 
     reg                      is_bus_locked;
     reg [AXI_ID_WIDTH-1:0]   lock_owner_id;
+
+    // -------------------------------------------------------------------------
+    // Pre-AW Write Beat Staging Buffer per WID
+    // -------------------------------------------------------------------------
+    reg [AXI_DATA_WIDTH-1:0] pre_w_data [0:NUM_IDS-1][0:PRE_W_DEPTH-1];
+    reg [STRB_WIDTH-1:0]     pre_w_strb [0:NUM_IDS-1][0:PRE_W_DEPTH-1];
+    reg                      pre_w_last [0:NUM_IDS-1][0:PRE_W_DEPTH-1];
+    reg [4:0]                pre_w_cnt  [0:NUM_IDS-1];
 
     function [AXI_ADDR_WIDTH-1:0] get_num_bytes;
         input [AXI_SIZE_WIDTH-1:0] size;
@@ -191,23 +200,17 @@ module AXI_SLAVE #(
             err_wrap_align = (burst == BURST_WRAP) && (|(addr & size_mask));
             err_4k         = (burst == BURST_INCR) && (addr[AXI_ADDR_WIDTH-1:12] != end_addr[AXI_ADDR_WIDTH-1:12]);
 
-            // AxPROT checks:
-            // prot[2]: 1 = Instruction access (Illegal for data RAM)
-            // prot[1]: 1 = Non-Secure (Illegal in secure region >= 0x4000)
-            // prot[0]: 0 = User mode (Illegal in secure region >= 0x4000)
             err_prot_instr = prot[2];
             err_prot_sec   = (addr >= SECURE_BASE_ADDR) && (prot[1] || !prot[0]);
-
-            // Locked Access violation: Locked by another master
             err_bus_locked = is_bus_locked && (lock_owner_id != id);
 
-            check_prot_error = (burst == BURST_RESERVED) || err_wrap_len || err_wrap_align || 
+            check_prot_error = (burst == BURST_RESERVED) || err_wrap_len || err_wrap_align ||
                                err_4k || err_prot_sec || err_prot_instr || err_bus_locked;
         end
     endfunction
 
     // -------------------------------------------------------------------------
-    // Address progression generator
+    // Address Progression Generator
     // -------------------------------------------------------------------------
     function [AXI_ADDR_WIDTH-1:0] calc_next_addr;
         input [AXI_ADDR_WIDTH-1:0] current_addr;
@@ -238,8 +241,8 @@ module AXI_SLAVE #(
     reg [NUM_SLOTS-1:0]      w_slot_complete;
     reg [NUM_SLOTS-1:0]      w_slot_err;
     reg [NUM_SLOTS-1:0]      w_slot_decerr;
-    reg [NUM_SLOTS-1:0]      w_slot_is_ex;     
-    reg [NUM_SLOTS-1:0]      w_slot_ex_pass;   
+    reg [NUM_SLOTS-1:0]      w_slot_is_ex;
+    reg [NUM_SLOTS-1:0]      w_slot_ex_pass;
     reg [AXI_ID_WIDTH-1:0]   w_slot_id        [0:NUM_SLOTS-1];
     reg [AXI_ADDR_WIDTH-1:0] w_slot_addr      [0:NUM_SLOTS-1];
     reg [AXI_LEN_WIDTH-1:0]  w_slot_len       [0:NUM_SLOTS-1];
@@ -248,6 +251,10 @@ module AXI_SLAVE #(
     reg [3:0]                w_slot_cache     [0:NUM_SLOTS-1];
     reg [AXI_LEN_WIDTH-1:0]  w_slot_beat_cnt  [0:NUM_SLOTS-1];
     reg [NUM_SLOTS-1:0]      w_dep_matrix     [0:NUM_SLOTS-1];
+
+    // Remaining pre-AW beats to replay for a given write slot
+    reg [4:0]                w_slot_pre_rem   [0:NUM_SLOTS-1];
+    reg [4:0]                w_slot_pre_idx   [0:NUM_SLOTS-1];
 
     reg free_w_slot_found;
     reg [SLOT_PTR_W-1:0] free_w_slot_idx;
@@ -267,26 +274,48 @@ module AXI_SLAVE #(
     reg wid_matched;
     reg [SLOT_PTR_W-1:0] matched_w_slot_idx;
     reg w_has_prior;
+    reg has_active_slot_for_wid;
+    reg pre_w_can_accept;
     integer k_w, k_w_sub;
     always @(*) begin
-        wid_matched        = 1'b0;
-        matched_w_slot_idx = {SLOT_PTR_W{1'b0}};
+        wid_matched             = 1'b0;
+        matched_w_slot_idx      = {SLOT_PTR_W{1'b0}};
+        has_active_slot_for_wid = 1'b0;
+
         for (k_w = 0; k_w < NUM_SLOTS; k_w = k_w + 1) begin
             if (w_slot_valid[k_w] && !w_slot_complete[k_w] && (w_slot_id[k_w] == WID)) begin
+                has_active_slot_for_wid = 1'b1;
                 w_has_prior = 1'b0;
                 for (k_w_sub = 0; k_w_sub < NUM_SLOTS; k_w_sub = k_w_sub + 1) begin
                     if (w_dep_matrix[k_w][k_w_sub] && (w_slot_id[k_w_sub] == WID) && !w_slot_complete[k_w_sub]) begin
                         w_has_prior = 1'b1;
                     end
                 end
-                if (!w_has_prior && !wid_matched) begin
+                if (!w_has_prior && !wid_matched && (w_slot_pre_rem[k_w] == 5'd0)) begin
                     wid_matched        = 1'b1;
                     matched_w_slot_idx = k_w[SLOT_PTR_W-1:0];
                 end
             end
         end
+
+        pre_w_can_accept = (!has_active_slot_for_wid) && (pre_w_cnt[WID] < PRE_W_DEPTH);
     end
-    assign WREADY = wid_matched;
+
+    reg                  replay_found;
+    reg [SLOT_PTR_W-1:0] replay_slot_idx;
+    integer k_rep;
+    always @(*) begin
+        replay_found    = 1'b0;
+        replay_slot_idx = {SLOT_PTR_W{1'b0}};
+        for (k_rep = 0; k_rep < NUM_SLOTS; k_rep = k_rep + 1) begin
+            if (w_slot_valid[k_rep] && !w_slot_complete[k_rep] && (w_slot_pre_rem[k_rep] > 5'd0) && !replay_found) begin
+                replay_found    = 1'b1;
+                replay_slot_idx = k_rep[SLOT_PTR_W-1:0];
+            end
+        end
+    end
+
+    assign WREADY = (wid_matched && !replay_found) || pre_w_can_accept;
 
     reg b_arb_found;
     reg [SLOT_PTR_W-1:0] b_arb_slot;
@@ -311,7 +340,15 @@ module AXI_SLAVE #(
         end
     end
 
-    wire [RAM_ADDR_W-1:0] w_ram_addr = w_slot_addr[matched_w_slot_idx][RAM_ADDR_W+BYTE_OFFSET-1:BYTE_OFFSET];
+    wire [SLOT_PTR_W-1:0] active_w_commit_slot = replay_found ? replay_slot_idx : matched_w_slot_idx;
+    wire [RAM_ADDR_W-1:0] w_ram_addr           = w_slot_addr[active_w_commit_slot][RAM_ADDR_W+BYTE_OFFSET-1:BYTE_OFFSET];
+
+    wire [AXI_DATA_WIDTH-1:0] commit_wdata = replay_found ?
+        pre_w_data[w_slot_id[replay_slot_idx]][w_slot_pre_idx[replay_slot_idx]] : WDATA;
+    wire [STRB_WIDTH-1:0] commit_wstrb = replay_found ?
+        pre_w_strb[w_slot_id[replay_slot_idx]][w_slot_pre_idx[replay_slot_idx]] : WSTRB;
+    wire commit_wlast = replay_found ?
+        pre_w_last[w_slot_id[replay_slot_idx]][w_slot_pre_idx[replay_slot_idx]] : WLAST;
 
     integer rst_i;
     integer clr_dep_i;
@@ -337,18 +374,19 @@ module AXI_SLAVE #(
             is_bus_locked   <= 1'b0;
             lock_owner_id   <= {AXI_ID_WIDTH{1'b0}};
             for (rst_i = 0; rst_i < NUM_SLOTS; rst_i = rst_i + 1) begin
-                w_dep_matrix[rst_i] <= {NUM_SLOTS{1'b0}};
+                w_dep_matrix[rst_i]   <= {NUM_SLOTS{1'b0}};
+                w_slot_pre_rem[rst_i] <= 5'd0;
+                w_slot_pre_idx[rst_i] <= 5'd0;
             end
             for (rst_i = 0; rst_i < NUM_IDS; rst_i = rst_i + 1) begin
                 ex_mon_valid[rst_i] <= 1'b0;
                 ex_mon_addr[rst_i]  <= {AXI_ADDR_WIDTH{1'b0}};
                 ex_mon_len[rst_i]   <= {AXI_LEN_WIDTH{1'b0}};
                 ex_mon_size[rst_i]  <= {AXI_SIZE_WIDTH{1'b0}};
+                pre_w_cnt[rst_i]    <= 5'd0;
             end
         end else begin
-            // -----------------------------------------------------------------
-            // 1. Bus Locking Arbitration (AWLOCK / ARLOCK == 2'b10)
-            // -----------------------------------------------------------------
+            // 1. Bus Locking Arbitration
             if (AWVALID && AWREADY) begin
                 if (AWLOCK == 2'b10) begin
                     is_bus_locked <= 1'b1;
@@ -365,9 +403,7 @@ module AXI_SLAVE #(
                 end
             end
 
-            // -----------------------------------------------------------------
             // 2. Exclusive Monitor Update by AR Channel
-            // -----------------------------------------------------------------
             if (ARVALID && ARREADY && (ARLOCK == 2'b01)) begin
                 ex_mon_valid[ARID] <= 1'b1;
                 ex_mon_addr[ARID]  <= ARADDR;
@@ -375,9 +411,7 @@ module AXI_SLAVE #(
                 ex_mon_size[ARID]  <= ARSIZE;
             end
 
-            // -----------------------------------------------------------------
-            // 3. AW Channel Handshake
-            // -----------------------------------------------------------------
+            // 3. AW Channel Handshake & Pre-AW Buffer Attachment
             if (AWVALID && AWREADY) begin
                 w_slot_valid[free_w_slot_idx]    <= 1'b1;
                 w_slot_complete[free_w_slot_idx] <= 1'b0;
@@ -394,6 +428,14 @@ module AXI_SLAVE #(
                 w_slot_is_ex[free_w_slot_idx]    <= is_aw_ex_candidate;
                 w_slot_ex_pass[free_w_slot_idx]  <= is_aw_ex_candidate && aw_ex_matches;
 
+                if (WVALID && WREADY && !wid_matched && pre_w_can_accept && (WID == AWID)) begin
+                    w_slot_pre_rem[free_w_slot_idx] <= pre_w_cnt[AWID] + 5'd1;
+                end else begin
+                    w_slot_pre_rem[free_w_slot_idx] <= pre_w_cnt[AWID];
+                end
+                w_slot_pre_idx[free_w_slot_idx] <= 5'd0;
+                pre_w_cnt[AWID]                 <= 5'd0;
+
                 if (is_aw_ex_candidate && aw_ex_matches) begin
                     ex_mon_valid[AWID] <= 1'b0;
                 end else if (!is_aw_ex_candidate) begin
@@ -405,44 +447,56 @@ module AXI_SLAVE #(
                 end
             end
 
-            // -----------------------------------------------------------------
-            // 4. W Channel Execution
-            // -----------------------------------------------------------------
-            if (WVALID && WREADY) begin
-                // Only commit to RAM if neither DECERR nor SLVERR occurred, and Exclusive matches
-                if (!w_slot_err[matched_w_slot_idx] && !w_slot_decerr[matched_w_slot_idx] &&
-                    (!w_slot_is_ex[matched_w_slot_idx] || w_slot_ex_pass[matched_w_slot_idx])) begin
+            // 4a. Buffer Pre-AW W Beats When No Active Slot Exists Yet for WID
+            if (WVALID && WREADY && !wid_matched && pre_w_can_accept) begin
+                pre_w_data[WID][pre_w_cnt[WID]] <= WDATA;
+                pre_w_strb[WID][pre_w_cnt[WID]] <= WSTRB;
+                pre_w_last[WID][pre_w_cnt[WID]] <= WLAST;
+                if (!(AWVALID && AWREADY && (WID == AWID))) begin
+                    pre_w_cnt[WID] <= pre_w_cnt[WID] + 5'd1;
+                end
+            end
+
+            // 4b. Commit Beat to RAM (Either Replayed Pre-AW Beat or Live W Beat)
+            if (replay_found || (WVALID && WREADY && wid_matched)) begin
+                if (!w_slot_err[active_w_commit_slot] && !w_slot_decerr[active_w_commit_slot] &&
+                    (!w_slot_is_ex[active_w_commit_slot] || w_slot_ex_pass[active_w_commit_slot])) begin
                     for (strb_i = 0; strb_i < STRB_WIDTH; strb_i = strb_i + 1) begin
-                        if (WSTRB[strb_i]) begin
-                            ram[w_ram_addr][(strb_i*8) +: 8] <= WDATA[(strb_i*8) +: 8];
+                        if (commit_wstrb[strb_i]) begin
+                            ram[w_ram_addr][(strb_i*8) +: 8] <= commit_wdata[(strb_i*8) +: 8];
                         end
                     end
                 end
 
-                if (WLAST != (w_slot_beat_cnt[matched_w_slot_idx] == w_slot_len[matched_w_slot_idx])) begin
-                    w_slot_err[matched_w_slot_idx] <= 1'b1;
+                if (commit_wlast != (w_slot_beat_cnt[active_w_commit_slot] == w_slot_len[active_w_commit_slot])) begin
+                    w_slot_err[active_w_commit_slot] <= 1'b1;
                 end
 
-                if ((w_slot_beat_cnt[matched_w_slot_idx] == w_slot_len[matched_w_slot_idx]) || WLAST) begin
-                    w_slot_complete[matched_w_slot_idx] <= 1'b1;
+                if ((w_slot_beat_cnt[active_w_commit_slot] == w_slot_len[active_w_commit_slot]) || commit_wlast) begin
+                    w_slot_complete[active_w_commit_slot] <= 1'b1;
+                    w_slot_pre_rem[active_w_commit_slot]  <= 5'd0;
                 end else begin
-                    w_slot_beat_cnt[matched_w_slot_idx] <= w_slot_beat_cnt[matched_w_slot_idx] + 1'b1;
-                    w_slot_addr[matched_w_slot_idx]     <= calc_next_addr(
-                        w_slot_addr[matched_w_slot_idx],
-                        w_slot_size[matched_w_slot_idx],
-                        w_slot_burst[matched_w_slot_idx],
-                        w_slot_len[matched_w_slot_idx]
+                    w_slot_beat_cnt[active_w_commit_slot] <= w_slot_beat_cnt[active_w_commit_slot] + 1'b1;
+                    w_slot_addr[active_w_commit_slot]     <= calc_next_addr(
+                        w_slot_addr[active_w_commit_slot],
+                        w_slot_size[active_w_commit_slot],
+                        w_slot_burst[active_w_commit_slot],
+                        w_slot_len[active_w_commit_slot]
                     );
+                    if (replay_found) begin
+                        w_slot_pre_rem[replay_slot_idx] <= w_slot_pre_rem[replay_slot_idx] - 5'd1;
+                        w_slot_pre_idx[replay_slot_idx] <= w_slot_pre_idx[replay_slot_idx] + 5'd1;
+                    end
                 end
             end
 
-            // -----------------------------------------------------------------
             // 5. B Channel Execution & Response Evaluation
-            // -----------------------------------------------------------------
             if (BVALID && BREADY) begin
                 BVALID                         <= 1'b0;
                 w_slot_valid[b_active_slot]    <= 1'b0;
                 w_slot_complete[b_active_slot] <= 1'b0;
+                w_slot_pre_rem[b_active_slot]  <= 5'd0;
+                w_slot_pre_idx[b_active_slot]  <= 5'd0;
                 for (clr_dep_i = 0; clr_dep_i < NUM_SLOTS; clr_dep_i = clr_dep_i + 1) begin
                     w_dep_matrix[clr_dep_i][b_active_slot] <= 1'b0;
                 end
@@ -451,7 +505,6 @@ module AXI_SLAVE #(
                 b_active_slot <= b_arb_slot;
                 BID           <= w_slot_id[b_arb_slot];
 
-                // Determine BRESP Priority: DECERR > SLVERR > EXOKAY > OKAY
                 if (w_slot_decerr[b_arb_slot]) begin
                     BRESP <= RESP_DECERR;
                 end else if (w_slot_err[b_arb_slot]) begin
@@ -475,7 +528,7 @@ module AXI_SLAVE #(
     reg [NUM_SLOTS-1:0]      r_slot_valid;
     reg [NUM_SLOTS-1:0]      r_slot_err;
     reg [NUM_SLOTS-1:0]      r_slot_decerr;
-    reg [NUM_SLOTS-1:0]      r_slot_is_ex;     
+    reg [NUM_SLOTS-1:0]      r_slot_is_ex;
     reg [AXI_ID_WIDTH-1:0]   r_slot_id        [0:NUM_SLOTS-1];
     reg [AXI_ADDR_WIDTH-1:0] r_slot_addr      [0:NUM_SLOTS-1];
     reg [AXI_LEN_WIDTH-1:0]  r_slot_len       [0:NUM_SLOTS-1];
@@ -515,7 +568,7 @@ module AXI_SLAVE #(
             if (r_slot_valid[r_candidate] && !sched_found) begin
                 r_blocked = 1'b0;
                 for (k_rr_dep = 0; k_rr_dep < NUM_SLOTS; k_rr_dep = k_rr_dep + 1) begin
-                    if (r_dep_matrix[r_candidate][k_rr_dep] && 
+                    if (r_dep_matrix[r_candidate][k_rr_dep] &&
                         (r_slot_id[k_rr_dep] == r_slot_id[r_candidate]) &&
                         r_slot_valid[k_rr_dep]) begin
                         r_blocked = 1'b1;
@@ -560,9 +613,7 @@ module AXI_SLAVE #(
                 r_dep_matrix[rst_r_i] <= {NUM_SLOTS{1'b0}};
             end
         end else begin
-            // -----------------------------------------------------------------
             // 1. AR Channel Handshake
-            // -----------------------------------------------------------------
             if (ARVALID && ARREADY) begin
                 r_slot_valid[free_r_slot_idx]    <= 1'b1;
                 r_slot_decerr[free_r_slot_idx]   <= check_decerr(ARADDR, ARLEN, ARSIZE);
@@ -578,19 +629,16 @@ module AXI_SLAVE #(
                 r_dep_matrix[free_r_slot_idx]    <= r_slot_valid;
             end
 
-            // -----------------------------------------------------------------
             // 2. Read Channel FSM
-            // -----------------------------------------------------------------
             case (r_state)
                 R_IDLE: begin
                     if (sched_found) begin
                         r_state       <= R_BURST;
                         r_active_slot <= sched_r_slot;
 
-                        // Drive beat 0
                         RVALID <= 1'b1;
                         RID    <= r_slot_id[sched_r_slot];
-                        
+
                         if (r_slot_decerr[sched_r_slot]) begin
                             RRESP <= RESP_DECERR;
                             RDATA <= {AXI_DATA_WIDTH{1'b0}};
@@ -631,7 +679,7 @@ module AXI_SLAVE #(
 
                             RVALID <= 1'b1;
                             RID    <= r_slot_id[r_active_slot];
-                            
+
                             if (r_slot_decerr[r_active_slot]) begin
                                 RRESP <= RESP_DECERR;
                                 RDATA <= {AXI_DATA_WIDTH{1'b0}};

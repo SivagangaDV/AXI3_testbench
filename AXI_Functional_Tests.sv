@@ -850,13 +850,20 @@ class AXI3_Wdata_Before_Addr_test extends axi_base_test;
     super.build_phase(phase);
     w_before_aw_seq = axi3_wdata_before_addr_seq::type_id::create("w_before_aw_seq");
 
-    // Enable decoupled leading write data streaming
-    master_drv_cfg.enable_write_interleaving = 1'b0;
-    master_drv_cfg.enable_aw_overlap         = 1'b1;
-    master_drv_cfg.enable_ar_overlap         = 1'b0;
+    // Enable decoupled leading write data streaming (multiple W beats before AW)
+    master_drv_cfg.enable_write_interleaving     = 1'b1;
+    master_drv_cfg.enable_aw_overlap             = 1'b1;
+    master_drv_cfg.enable_ar_overlap             = 1'b0;
+    master_drv_cfg.enable_wdata_before_addr      = 1'b1;
+    master_drv_cfg.pre_aw_wdata_beats            = 3;     // Complete 3 W beats before asserting AW
+    master_drv_cfg.wdata_before_addr_delay_clk   = 5;     // Delay/window before releasing AW
+    master_drv_cfg.post_wlast_delay_clk          = 1;     // Clean idle gap after WLAST before next burst
+    master_drv_cfg.wait_aw_before_next_wdata     = 1'b1;
+    master_drv_cfg.max_pre_aw_wait_cycles        = 50;    // Safety timeout in clock cycles
+    master_drv_cfg.inject_wdata_before_addr_once = 1'b0;
 
-    master_mon_cfg.enable_protocol_checks    = 1'b1;
-    slave_mon_cfg.enable_protocol_checks     = 1'b1;
+    master_mon_cfg.enable_protocol_checks        = 1'b1;
+    slave_mon_cfg.enable_protocol_checks         = 1'b1;
 
     uvm_config_db#(axi_driver_config)::set(this, "env.mstr_agent.drv", "master_driver_config", master_drv_cfg);
     uvm_config_db#(axi_monitor_config)::set(this, "env.mstr_agent.mon", "master_mon_cfg", master_mon_cfg);

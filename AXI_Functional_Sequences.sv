@@ -1083,53 +1083,93 @@ endclass : axi3_locked_sequence_seq
   //============================================================================
   // TC-17: axi3_wdata_before_addr_seq (Spec A3.3.1 - Write Data & Strobe Controls)
   //============================================================================
-  class axi3_wdata_before_addr_seq extends axi_base_seq;
-    `uvm_object_utils(axi3_wdata_before_addr_seq)
+class axi3_wdata_before_addr_seq extends uvm_sequence #(axi_seq_item);
+  `uvm_object_utils(axi3_wdata_before_addr_seq)
 
-    function new(string name = "axi3_wdata_before_addr_seq");
-      super.new(name);
-    endfunction
+  function new(string name = "axi3_wdata_before_addr_seq");
+    super.new(name);
+  endfunction
 
-    virtual task body();
-      bit [ADDR_WIDTH-1:0] test_addr = 16'h1800;
-      axi_resp_e           bresp_out;
-      bit [DATA_WIDTH-1:0] wdata_out[];
-      axi_resp_e           rresp_out[];
-      bit [DATA_WIDTH-1:0] rdata_out[];
+  virtual task body();
+    axi_seq_item wr_item[3];
+    axi_seq_item rd_item[3];
+    int          num_beats[3];
+    bit [15:0]   base_addr[3];
+    bit [3:0]    txn_id[3];
 
-      `uvm_info(get_type_name(), "Starting TC-17 Decoupled WDATA-Before-AWADDR Test...", UVM_LOW)
+    // 1. Issue all 3 writes back-to-back so active_w_pool can interleave W beats before AW
+    for (int tx = 0; tx < 3; tx++) begin
+      num_beats[tx] = (tx == 1) ? 8 : 4;          // 4-beat, 8-beat, 4-beat bursts
+      base_addr[tx] = 16'h1000 + (tx * 16'h0040);
+      txn_id[tx]    = 4'h1 + tx[3:0];
 
-      enable_overlap = 1'b1;
-      write_burst_ext(
-        .id(4'h4),
-        .addr(test_addr),
-        .len(4'd3),
-        .size(default_size),
-        .burst(BURST_INCR),
-        .lock(2'b00),
-        .base_data(32'hFACE_0000),
-        .strb_val({STRB_WIDTH{1'b1}}),
-        .bresp_out(bresp_out),
-        .wdata_out(wdata_out)
-      );
+      wr_item[tx] = axi_seq_item::type_id::create($sformatf("wr_item_%0d", tx));
+      start_item(wr_item[tx]);
 
-      if (bresp_out != RESP_OKAY) begin
-        `uvm_error(get_type_name(), $sformatf("Expected RESP_OKAY response, got %0s", bresp_out.name()))
+      wr_item[tx].trans_type = AXI_WRITE;
+      wr_item[tx].id         = txn_id[tx];
+      wr_item[tx].addr       = base_addr[tx];
+      wr_item[tx].len        = num_beats[tx] - 1;
+      wr_item[tx].size       = 3'd2;
+      wr_item[tx].burst      = BURST_INCR;
+      wr_item[tx].lock       = 2'b00;
+      wr_item[tx].cache      = 4'b0011;
+      wr_item[tx].prot       = 3'b000;
+
+      wr_item[tx].wdata = new[num_beats[tx]];
+      wr_item[tx].wstrb = new[num_beats[tx]];
+      for (int b = 0; b < num_beats[tx]; b++) begin
+        wr_item[tx].wdata[b] = 32'hA000_0000 | (32'(txn_id[tx]) << 16) | (b * 32'h0000_0100);
+        wr_item[tx].wstrb[b] = 4'b1111;
       end
 
-      read_burst_ext(
-        .id(4'h4),
-        .addr(test_addr),
-        .len(4'd3),
-        .size(default_size),
-        .burst(BURST_INCR),
-        .lock(2'b00),
-        .rresp_out(rresp_out),
-        .rdata_out(rdata_out)
-      );
-    endtask
-  endclass : axi3_wdata_before_addr_seq
+      finish_item(wr_item[tx]);
+    end
 
+    // 2. Wait for all write responses
+    for (int tx = 0; tx < 3; tx++) begin
+      if (!wr_item[tx].is_completed) begin
+        @(wr_item[tx].done_event);
+      end
+
+      if (wr_item[tx].bresp != RESP_OKAY) begin
+        `uvm_error(get_type_name(), $sformatf(
+          "Write tx=%0d (ID=0x%0h, ADDR=0x%0h) expected OKAY BRESP, got %0p",
+          tx, txn_id[tx], base_addr[tx], wr_item[tx].bresp))
+      end
+    end
+
+    // 3. Read back and verify all 3 bursts
+    for (int tx = 0; tx < 3; tx++) begin
+      rd_item[tx] = axi_seq_item::type_id::create($sformatf("rd_item_%0d", tx));
+      start_item(rd_item[tx]);
+
+      rd_item[tx].trans_type = AXI_READ;
+      rd_item[tx].id         = txn_id[tx];
+      rd_item[tx].addr       = base_addr[tx];
+      rd_item[tx].len        = num_beats[tx] - 1;
+      rd_item[tx].size       = 3'd2;
+      rd_item[tx].burst      = BURST_INCR;
+      rd_item[tx].lock       = 2'b00;
+      rd_item[tx].cache      = 4'b0011;
+      rd_item[tx].prot       = 3'b000;
+
+      finish_item(rd_item[tx]);
+
+      if (!rd_item[tx].is_completed) begin
+        @(rd_item[tx].done_event);
+      end
+
+      for (int b = 0; b < num_beats[tx]; b++) begin
+        if (b < rd_item[tx].rdata.size() && (rd_item[tx].rdata[b] !== wr_item[tx].wdata[b])) begin
+          `uvm_error(get_type_name(), $sformatf(
+            "Data mismatch on tx=%0d beat=%0d at ADDR=0x%0h: exp=0x%08h act=0x%08h",
+            tx, b, base_addr[tx] + (b * 4), wr_item[tx].wdata[b], rd_item[tx].rdata[b]))
+        end
+      end
+    end
+  endtask
+endclass : axi3_wdata_before_addr_seq
   //============================================================================
   // TC-20: axi3_out_of_order_rid_seq (Spec A8.1 - Transaction IDs & Interleaving)
   //============================================================================
