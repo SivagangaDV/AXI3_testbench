@@ -29,8 +29,10 @@ class axi_master_drv extends uvm_driver #(axi_seq_item);
       `uvm_fatal("NO_VIF", "Virtual interface 'vif' not found in uvm_config_db")
     end
     if (!uvm_config_db#(axi_driver_config)::get(this, "", "master_driver_config", drv_cfg)) begin
+      `uvm_warning("NO_DRV_CFG", "master_driver_config not found in uvm_config_db; using 0-delay defaults")
       drv_cfg = axi_driver_config::type_id::create("drv_cfg");
     end
+	
   endfunction : build_phase
 
   // ---------------------------------------------------------------------------
@@ -354,15 +356,31 @@ class axi_master_drv extends uvm_driver #(axi_seq_item);
                 drv_cfg.bready_delay_clk;
 
       if (b_delay > 0) begin
+        // Delay enabled: hold BREADY=0 until BVALID=1, wait b_delay cycles, then assert BREADY=1
         vif.BREADY <= 1'b0;
-        repeat (b_delay) @(posedge vif.ACLK);
+        do begin
+          @(posedge vif.ACLK);
+        end while (!vif.BVALID && vif.ARESETn === 1'b1);
+
+        if (vif.ARESETn !== 1'b1) continue;
+
+        repeat (b_delay) begin
+          if (vif.ARESETn === 1'b1) @(posedge vif.ACLK);
+        end
+
+        if (vif.ARESETn !== 1'b1) continue;
+
+        vif.BREADY <= 1'b1;
+        do begin
+          @(posedge vif.ACLK);
+        end while (!vif.BVALID && vif.ARESETn === 1'b1);
+      end else begin
+        // Delay disabled: keep original behavior
+        vif.BREADY <= 1'b1;
+        do begin
+          @(posedge vif.ACLK);
+        end while (!vif.BVALID && vif.ARESETn === 1'b1);
       end
-
-      vif.BREADY <= 1'b1;
-
-      do begin
-        @(posedge vif.ACLK);
-      end while (!vif.BVALID && vif.ARESETn === 1'b1);
 
       if (vif.ARESETn !== 1'b1) continue;
 
@@ -479,15 +497,31 @@ class axi_master_drv extends uvm_driver #(axi_seq_item);
                 drv_cfg.rready_delay_clk;
 
       if (r_delay > 0) begin
+        // Delay enabled: hold RREADY=0 until RVALID=1, wait r_delay cycles, then assert RREADY=1
         vif.RREADY <= 1'b0;
-        repeat (r_delay) @(posedge vif.ACLK);
+        do begin
+          @(posedge vif.ACLK);
+        end while (!vif.RVALID && vif.ARESETn === 1'b1);
+
+        if (vif.ARESETn !== 1'b1) continue;
+
+        repeat (r_delay) begin
+          if (vif.ARESETn === 1'b1) @(posedge vif.ACLK);
+        end
+
+        if (vif.ARESETn !== 1'b1) continue;
+
+        vif.RREADY <= 1'b1;
+        do begin
+          @(posedge vif.ACLK);
+        end while (!vif.RVALID && vif.ARESETn === 1'b1);
+      end else begin
+        // Delay disabled: keep original behavior
+        vif.RREADY <= 1'b1;
+        do begin
+          @(posedge vif.ACLK);
+        end while (!vif.RVALID && vif.ARESETn === 1'b1);
       end
-
-      vif.RREADY <= 1'b1;
-
-      do begin
-        @(posedge vif.ACLK);
-      end while (!vif.RVALID && vif.ARESETn === 1'b1);
 
       if (vif.ARESETn !== 1'b1) continue;
 

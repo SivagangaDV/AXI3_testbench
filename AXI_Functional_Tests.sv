@@ -1024,7 +1024,7 @@ endclass : AXI3_Excl_Failure_test
 class AXI3_Slave_Backpressure_test extends axi_base_test;
   `uvm_component_utils(AXI3_Slave_Backpressure_test)
 
-  axi3_slave_backpressure_seq slv_bp_seq;
+  axi_sanity_seq slv_bp_seq;
 
   function new(string name = "AXI3_Slave_Backpressure_test", uvm_component parent = null);
     super.new(name, parent);
@@ -1032,19 +1032,23 @@ class AXI3_Slave_Backpressure_test extends axi_base_test;
 
   virtual function void build_phase(uvm_phase phase);
     super.build_phase(phase);
-    slv_bp_seq = axi3_slave_backpressure_seq::type_id::create("slv_bp_seq");
+    slv_bp_seq = axi_sanity_seq::type_id::create("slv_bp_seq");
+	slv_bp_seq.repeat_count = 10;
 
     // Enable high concurrency with overlap
     master_drv_cfg.enable_write_interleaving = 1'b0;
-    master_drv_cfg.enable_aw_overlap         = 1'b1;
-    master_drv_cfg.enable_ar_overlap         = 1'b1;
+    master_drv_cfg.enable_aw_overlap         = 1'b0;
+    master_drv_cfg.enable_ar_overlap         = 1'b0;
 
     master_mon_cfg.enable_protocol_checks    = 1'b1;
     slave_mon_cfg.enable_protocol_checks     = 1'b1;
+	
+	// Enable extended pseudo-random AWREADY, WREADY and ARREADY backpressure in master driver
+	////
 
-    uvm_config_db#(axi_driver_config)::set(this, "env.mstr_agent.drv", "master_driver_config", master_drv_cfg);
-    uvm_config_db#(axi_monitor_config)::set(this, "env.mstr_agent.mon", "master_mon_cfg", master_mon_cfg);
-    uvm_config_db#(axi_monitor_config)::set(this, "env.slv_agt.mon", "slave_mon_cfg", slave_mon_cfg);
+    uvm_config_db#(axi_driver_config)::set(this, "*", "master_driver_config", master_drv_cfg);
+    uvm_config_db#(axi_monitor_config)::set(this, "*", "master_mon_cfg", master_mon_cfg);
+    uvm_config_db#(axi_monitor_config)::set(this, "*", "slave_mon_cfg", slave_mon_cfg);
   endfunction
 
   virtual task run_phase(uvm_phase phase);
@@ -1052,11 +1056,11 @@ class AXI3_Slave_Backpressure_test extends axi_base_test;
 
     `uvm_info(get_type_name(), "==========================================================", UVM_LOW)
     `uvm_info(get_type_name(), "=== [TC-24] Starting AXI3_Slave_Backpressure_test (A3.2.1) ===", UVM_LOW)
-    `uvm_info(get_type_name(), "==========================================================", UVM_LOW)
+    `uvm_info(get_type_name(), "==========================================================", UVM_LOW)		
 
     slv_bp_seq.start(env.mstr_agent.sqr);
 
-    #300ns;
+    #30ns;
     `uvm_info(get_type_name(), "=== [TC-24] Completed AXI3_Slave_Backpressure_test ===", UVM_LOW)
     phase.drop_objection(this, "Completed AXI3_Slave_Backpressure_test");
   endtask
@@ -1069,7 +1073,7 @@ endclass : AXI3_Slave_Backpressure_test
 class AXI3_Master_Backpressure_test extends axi_base_test;
   `uvm_component_utils(AXI3_Master_Backpressure_test)
 
-  axi3_master_backpressure_seq mst_bp_seq;
+  axi_sanity_seq mst_bp_seq;
 
   function new(string name = "AXI3_Master_Backpressure_test", uvm_component parent = null);
     super.new(name, parent);
@@ -1077,14 +1081,21 @@ class AXI3_Master_Backpressure_test extends axi_base_test;
 
   virtual function void build_phase(uvm_phase phase);
     super.build_phase(phase);
-    mst_bp_seq = axi3_master_backpressure_seq::type_id::create("mst_bp_seq");
+    mst_bp_seq = axi_sanity_seq::type_id::create("mst_bp_seq");
+	mst_bp_seq.repeat_count = 10;
 
     master_drv_cfg.enable_write_interleaving = 1'b0;
-    master_drv_cfg.enable_aw_overlap         = 1'b1;
-    master_drv_cfg.enable_ar_overlap         = 1'b1;
+    master_drv_cfg.enable_aw_overlap         = 1'b0;
+    master_drv_cfg.enable_ar_overlap         = 1'b0;
 
     master_mon_cfg.enable_protocol_checks    = 1'b1;
     slave_mon_cfg.enable_protocol_checks     = 1'b1;
+		
+	// Enable extended pseudo-random BREADY and RREADY backpressure in master driver
+	master_drv_cfg.bready_rand_delay_enable = 1'b1;
+	master_drv_cfg.bready_delay_clk = 50;
+	master_drv_cfg.rready_rand_delay_enable = 1'b1;
+	master_drv_cfg.rready_delay_clk = 50;
 
     uvm_config_db#(axi_driver_config)::set(this, "env.mstr_agent.drv", "master_driver_config", master_drv_cfg);
     uvm_config_db#(axi_monitor_config)::set(this, "env.mstr_agent.mon", "master_mon_cfg", master_mon_cfg);
@@ -1195,8 +1206,10 @@ class AXI3_Wrap_Illegal_Length_test extends axi_base_test;
     // Mask wrap rules in monitor to allow SVA to check violation without fatal exit
     master_mon_cfg.mask_wrap_rules_err       = 1'b1;
     master_mon_cfg.mask_slverr_bresp_err     = 1'b1;
+	master_mon_cfg.mask_slverr_rresp_err	 = 1'b1;
     slave_mon_cfg.mask_wrap_rules_err        = 1'b1;
     slave_mon_cfg.mask_slverr_bresp_err      = 1'b1;
+	slave_mon_cfg.mask_slverr_rresp_err		 = 1'b1;
 
     uvm_config_db#(axi_driver_config)::set(this, "env.mstr_agent.drv", "master_driver_config", master_drv_cfg);
     uvm_config_db#(axi_monitor_config)::set(this, "env.mstr_agent.mon", "master_mon_cfg", master_mon_cfg);

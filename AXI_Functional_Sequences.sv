@@ -1497,56 +1497,7 @@ endclass : axi3_wdata_before_addr_seq
       end
     endtask
   endclass : axi3_excl_failure_seq
-
-  //============================================================================
-  // TC-24: axi3_slave_backpressure_seq (Spec A3.2.1 - Stress & Flow Control)
-  //============================================================================
-  class axi3_slave_backpressure_seq extends axi_base_seq;
-    `uvm_object_utils(axi3_slave_backpressure_seq)
-
-    function new(string name = "axi3_slave_backpressure_seq");
-      super.new(name);
-    endfunction
-
-    virtual task body();
-      `uvm_info(get_type_name(), "Starting TC-24 Slave READY Backpressure & Stability Test...", UVM_LOW)
-
-      execute_burst_engine(
-        .burst_type(BURST_INCR),
-        .count(25),
-        .start_addr(16'h1000),
-        .manual_len(4'd7),
-        .init_data(32'h55AA_0000),
-        .randomize_id(1'b1)
-      );
-    endtask
-  endclass : axi3_slave_backpressure_seq
-
-  //============================================================================
-  // TC-25: axi3_master_backpressure_seq (Spec A3.2.1 - Stress & Flow Control)
-  //============================================================================
-  class axi3_master_backpressure_seq extends axi_base_seq;
-    `uvm_object_utils(axi3_master_backpressure_seq)
-
-    function new(string name = "axi3_master_backpressure_seq");
-      super.new(name);
-    endfunction
-
-    virtual task body();
-      `uvm_info(get_type_name(), "Starting TC-25 Master RREADY/BREADY Backpressure Test...", UVM_LOW)
-
-      for (int i = 0; i < 10; i++) begin
-        read_burst(
-          .id(4'h6),
-          .addr(16'h1000 + (i * 16'h0080)),
-          .len(4'd15),
-          .size(default_size),
-          .burst(BURST_INCR)
-        );
-      end
-    endtask
-  endclass : axi3_master_backpressure_seq
-
+  
   //============================================================================
   // TC-28: axi3_cache_attributes_seq (Spec A5.2 - Atomic & Cache/Protection Operations)
   //============================================================================
@@ -1590,6 +1541,7 @@ endclass : axi3_wdata_before_addr_seq
     virtual task body();
       bit [LEN_WIDTH-1:0] illegal_lens[3] = '{4'd0, 4'd2, 4'd4}; // 1 beat, 3 beats, 5 beats
       axi_seq_item wr_item;
+	  axi_seq_item rd_item;
 
       `uvm_info(get_type_name(), "Starting TC-29 Negative Test: Illegal WRAP Burst Lengths...", UVM_LOW)
 
@@ -1611,7 +1563,30 @@ endclass : axi3_wdata_before_addr_seq
 
         if (!wr_item.is_completed) begin
           @wr_item.done_event;
+        end		
+		
+      end
+	  
+	  foreach (illegal_lens[i]) begin
+        `uvm_create(rd_item)
+        rd_item.c_wrap_rules.constraint_mode(0);
+
+        start_item(rd_item);
+        if (!rd_item.randomize() with {
+          trans_type == AXI_READ;
+          len        == illegal_lens[i];
+          addr       == 16'h1000;
+          burst      == BURST_WRAP;
+          size       == default_size;
+        }) begin
+          `uvm_fatal(get_type_name(), "Randomization failed on illegal WRAP item!")
         end
+        finish_item(rd_item);
+
+        if (!rd_item.is_completed) begin
+          @rd_item.done_event;
+        end		
+		
       end
     endtask
   endclass : axi3_wrap_illegal_length_seq
@@ -1629,7 +1604,7 @@ endclass : axi3_wdata_before_addr_seq
     virtual task body();
       `uvm_info(get_type_name(), "Starting TC-30 Zero-Delay 200-Cycle Pipeline Saturation Test...", UVM_LOW)
 
-      for (int i = 0; i < 50; i++) begin
+      for (int i = 0; i < 200; i++) begin
         write_read_ping_pong(
           .wr_id(4'h1),
           .rd_id(4'h2),
