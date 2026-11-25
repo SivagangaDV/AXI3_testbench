@@ -81,27 +81,68 @@ AXI3_testbench/
 
 ### Compiling and Running a Simulation
 
-Compile the package, interface, DUT, and top-level testbench, then invoke `run_test()` via `+UVM_TESTNAME`:
+Compile the top-level testbench `AXI_tb.sv` (which includes the package, interface, and DUT files), then invoke `run_test()` via `+UVM_TESTNAME`.
 
 #### Siemens QuestaSim / ModelSim
-```bash
-vlib work
-vlog -sv +acc +incdir+. AXI_tb.sv
-vsim -c work.AXI_tb +UVM_TESTNAME=<test_name> +UVM_VERBOSITY=UVM_MEDIUM -do "run -all; quit"
-```
+
+* Standard Run:
+  ```bash
+  vlib work
+  vlog -sv +acc +incdir+. AXI_tb.sv
+  vsim -c work.AXI_tb +UVM_TESTNAME=<test_name> +UVM_VERBOSITY=UVM_MEDIUM -do "run -all; quit"
+  ```
+
+* With Code & Functional Coverage Enabled (`UCDB` export & HTML report):
+  ```bash
+  vlib work
+  vlog -sv +acc +cover=bcesft +incdir+. AXI_tb.sv
+  vsim -c -coverage work.AXI_tb +UVM_TESTNAME=<test_name> +UVM_VERBOSITY=UVM_MEDIUM \
+       -do "coverage save -onexit cov_<test_name>.ucdb; run -all; quit"
+
+  # Merge multiple regression UCDB files and generate HTML coverage report
+  vcover merge merged_cov.ucdb cov_*.ucdb
+  vcover report -html -htmldir cov_html_report merged_cov.ucdb
+  ```
+  > `+cover=bcesft` enables **B**ranch, **C**ondition, **E**xpression, **S**tatement, **F**SM, and **T**oggle coverage.
+
+---
 
 #### Synopsys VCS
-```bash
-vcs -sverilog -ntb_opts uvm-1.2 +incdir+. AXI_tb.sv -o simv
-./simv +UVM_TESTNAME=<test_name> +UVM_VERBOSITY=UVM_MEDIUM
-```
+
+* Standard Run:
+  ```bash
+  vcs -sverilog -ntb_opts uvm-1.2 +incdir+. AXI_tb.sv -o simv
+  ./simv +UVM_TESTNAME=<test_name> +UVM_VERBOSITY=UVM_MEDIUM
+  ```
+
+* With Code & Functional Coverage Enabled (`URG` report):
+  ```bash
+  vcs -sverilog -ntb_opts uvm-1.2 -cm line+cond+fsm+tgl+branch+assert +incdir+. AXI_tb.sv -o simv
+  ./simv -cm line+cond+fsm+tgl+branch+assert -cm_name <test_name> \
+         +UVM_TESTNAME=<test_name> +UVM_VERBOSITY=UVM_MEDIUM
+
+  # Generate merged HTML coverage report
+  urg -dir simv.vdb -report urg_cov_report
+  ```
+
+---
 
 #### Cadence Xcelium
-```bash
-xrun -sv -uvm +incdir+. AXI_tb.sv +UVM_TESTNAME=<test_name>
-```
 
-> **Note:** Replace `<test_name>` with a test class defined in `AXI_Functional_Tests.sv` or `AXI_ERR_tests.sv` (for example, `AXI3_Sanity_test`).
+* Standard Run:
+  ```bash
+  xrun -sv -uvm +incdir+. AXI_tb.sv +UVM_TESTNAME=<test_name>
+  ```
+
+* With Code & Functional Coverage Enabled (`IMC` report):
+  ```bash
+  xrun -sv -uvm -coverage all -covoverwrite +incdir+. AXI_tb.sv \
+       +UVM_TESTNAME=<test_name> +UVM_VERBOSITY=UVM_MEDIUM
+
+  # Generate HTML coverage report via IMC
+  imc -execcmd "load -run cov_work/scope/test; report -html -out imc_cov_report"
+  ```
+> Note: Replace `<test_name>` with a test class defined in `AXI_Functional_Tests.sv` or `AXI_ERR_tests.sv` (for example, `AXI3_Sanity_test`).
 
 ---
 
