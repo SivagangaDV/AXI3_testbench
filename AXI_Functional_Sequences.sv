@@ -975,7 +975,7 @@ endclass : axi3_locked_sequence_seq
     endtask
   endclass : axi3_wlast_protocol_seq
 
-  //============================================================================
+ //============================================================================
   // TC-14: axi3_rlast_tracking_seq (Spec A3.4.4 - Read Channel Integrity & Ordering)
   //============================================================================
   class axi3_rlast_tracking_seq extends axi_base_seq;
@@ -986,15 +986,53 @@ endclass : axi3_locked_sequence_seq
     endfunction
 
     virtual task body();
+      axi_seq_item         wr_item;
       axi_resp_e           rresp_out[];
       bit [DATA_WIDTH-1:0] rdata_out[];
+      bit [15:0]           base_addr;
 
       `uvm_info(get_type_name(), "Starting TC-14 RLAST Tracking Test on 16-beat Bursts...", UVM_LOW)
 
       for (int latency_profile = 0; latency_profile < 3; latency_profile++) begin
+        base_addr = 16'h3000 + (latency_profile * 16'h0080);
+
+        // 1. Pre-load 16 beats so RAM has known data before reading
+        wr_item = axi_seq_item::type_id::create($sformatf("tc14_wr_item_%0d", latency_profile));
+        start_item(wr_item);
+
+        wr_item.trans_type = AXI_WRITE;
+        wr_item.id         = 4'h3;
+        wr_item.addr       = base_addr;
+        wr_item.len        = 4'd15;
+        wr_item.size       = default_size;
+        wr_item.burst      = BURST_INCR;
+        wr_item.lock       = 2'b00;
+        wr_item.cache      = 4'b0011;
+        wr_item.prot       = 3'b000;
+
+        wr_item.wdata = new[16];
+        wr_item.wstrb = new[16];
+        for (int b = 0; b < 16; b++) begin
+          wr_item.wdata[b] = 32'hC000_0000 | (32'(latency_profile) << 16) | (b * 32'h0000_0100);
+          wr_item.wstrb[b] = {STRB_WIDTH{1'b1}};
+        end
+
+        finish_item(wr_item);
+
+        if (!wr_item.is_completed) begin
+          @(wr_item.done_event);
+        end
+
+        if (wr_item.bresp != RESP_OKAY) begin
+          `uvm_error(get_type_name(), $sformatf(
+            "Latency profile %0d: Write pre-load failed with BRESP=%0p",
+            latency_profile, wr_item.bresp))
+        end
+
+        // 2. Read back 16 beats and verify beat count, RRESP, and RDATA ordering
         read_burst_ext(
           .id(4'h3),
-          .addr(16'h3000 + (latency_profile * 16'h0080)),
+          .addr(base_addr),
           .len(4'd15),
           .size(default_size),
           .burst(BURST_INCR),
@@ -1004,8 +1042,28 @@ endclass : axi3_locked_sequence_seq
         );
 
         if (rdata_out.size() != 16) begin
-          `uvm_error(get_type_name(), $sformatf("Latency profile %0d: Expected 16 beats, received %0d!",
-                     latency_profile, rdata_out.size()))
+          `uvm_error(get_type_name(), $sformatf(
+            "Latency profile %0d: Expected 16 beats, received %0d!",
+            latency_profile, rdata_out.size()))
+        end
+
+        if (rresp_out.size() != 16) begin
+          `uvm_error(get_type_name(), $sformatf(
+            "Latency profile %0d: Expected 16 RRESP entries, received %0d!",
+            latency_profile, rresp_out.size()))
+        end
+
+        for (int b = 0; b < 16; b++) begin
+          if ((b < rresp_out.size()) && (rresp_out[b] != RESP_OKAY)) begin
+            `uvm_error(get_type_name(), $sformatf(
+              "Latency profile %0d beat %0d: Expected RESP_OKAY, got %0p",
+              latency_profile, b, rresp_out[b]))
+          end
+          if ((b < rdata_out.size()) && (rdata_out[b] !== wr_item.wdata[b])) begin
+            `uvm_error(get_type_name(), $sformatf(
+              "Latency profile %0d beat %0d: RDATA mismatch! exp=0x%08h act=0x%08h",
+              latency_profile, b, wr_item.wdata[b], rdata_out[b]))
+          end
         end
       end
     endtask
@@ -1170,8 +1228,9 @@ class axi3_wdata_before_addr_seq extends uvm_sequence #(axi_seq_item);
     end
   endtask
 endclass : axi3_wdata_before_addr_seq
-  //============================================================================
-  // TC-20: axi3_out_of_order_rid_seq (Spec A8.1 - Transaction IDs & Interleaving)
+  
+ //============================================================================
+  // TC-20: axi3_out_of_order_rid_seq (Spec A8.1 - 5-Burst Out-of-Order RID Test)
   //============================================================================
   class axi3_out_of_order_rid_seq extends axi_base_seq;
     `uvm_object_utils(axi3_out_of_order_rid_seq)
@@ -1181,34 +1240,87 @@ endclass : axi3_wdata_before_addr_seq
     endfunction
 
     virtual task body();
-      `uvm_info(get_type_name(), "Starting TC-20 Out-Of-Order RID Reordering Test...", UVM_LOW)
+      int                  num_beats[5];
+      bit [ADDR_WIDTH-1:0] base_addr[5];
+      bit [ID_WIDTH-1:0]   txn_id[5];
+      bit [DATA_WIDTH-1:0] exp_wdata[5][];
+      bit [DATA_WIDTH-1:0] wdata_tmp[];
+      axi_resp_e           bresp_tmp;
 
-      fork
-        begin
-          // ARID = 1 targeting high-latency address space in SRAM (0x3000)
-          read_burst(
-            .id(4'h1),
-            .addr(16'h3000),
-            .len(4'd3),
-            .size(default_size),
-            .burst(BURST_INCR)
-          );
-        end
+      `uvm_info(get_type_name(), "Starting TC-20 5-Burst Out-Of-Order RID Reordering Test...", UVM_LOW)
 
-        begin
-          // ARID = 2 targeting fast SRAM zone (0x1000)
-          read_burst(
-            .id(4'h2),
-            .addr(16'h1000),
-            .len(4'd3),
-            .size(default_size),
-            .burst(BURST_INCR)
-          );
+      txn_id[0] = 4'h1; base_addr[0] = 16'h3000; num_beats[0] = 8;
+      txn_id[1] = 4'h2; base_addr[1] = 16'h3100; num_beats[1] = 4;
+      txn_id[2] = 4'h3; base_addr[2] = 16'h1000; num_beats[2] = 2;
+      txn_id[3] = 4'h4; base_addr[3] = 16'h3200; num_beats[3] = 16;
+      txn_id[4] = 4'h5; base_addr[4] = 16'h1100; num_beats[4] = 6;
+
+      // 1. Pre-load all 5 address regions using axi_base_seq::write_burst_ext
+      for (int i = 0; i < 5; i++) begin
+        write_burst_ext(
+          .id(txn_id[i]),
+          .addr(base_addr[i]),
+          .len(num_beats[i] - 1),
+          .size(default_size),
+          .burst(BURST_INCR),
+          .lock(2'b00),
+          .base_data(32'hD000_0000 | (32'(txn_id[i]) << 16)),
+          .bresp_out(bresp_tmp),
+          .wdata_out(wdata_tmp)
+        );
+        exp_wdata[i] = wdata_tmp;
+
+        if (bresp_tmp != RESP_OKAY) begin
+          `uvm_error(get_type_name(), $sformatf("Write %0d (ID=0x%0h) BRESP=%0p", i, txn_id[i], bresp_tmp))
         end
-      join
+      end
+
+      // 2. Issue all 5 reads concurrently so AXI_SLAVE interleaves & finishes out of order
+      for (int i = 0; i < 5; i++) begin
+        automatic int idx = i;
+        fork
+          begin
+            axi_resp_e           rresp_out[];
+            bit [DATA_WIDTH-1:0] rdata_out[];
+
+            read_burst_ext(
+              .id(txn_id[idx]),
+              .addr(base_addr[idx]),
+              .len(num_beats[idx] - 1),
+              .size(default_size),
+              .burst(BURST_INCR),
+              .lock(2'b00),
+              .rresp_out(rresp_out),
+              .rdata_out(rdata_out)
+            );
+
+            if (rdata_out.size() != num_beats[idx]) begin
+              `uvm_error(get_type_name(), $sformatf(
+                "Read %0d (ID=0x%0h): Expected %0d beats, got %0d",
+                idx, txn_id[idx], num_beats[idx], rdata_out.size()))
+            end
+
+            for (int b = 0; b < num_beats[idx]; b++) begin
+              if (b < rresp_out.size() && rresp_out[b] != RESP_OKAY) begin
+                `uvm_error(get_type_name(), $sformatf(
+                  "Read %0d (ID=0x%0h) beat %0d: RRESP=%0p", idx, txn_id[idx], b, rresp_out[b]))
+              end
+              if (b < rdata_out.size() && rdata_out[b] !== exp_wdata[idx][b]) begin
+                `uvm_error(get_type_name(), $sformatf(
+                  "Read %0d (ID=0x%0h) beat %0d: RDATA exp=0x%08h act=0x%08h",
+                  idx, txn_id[idx], b, exp_wdata[idx][b], rdata_out[b]))
+              end
+            end
+          end
+        join_none
+      end
+      wait fork;
     endtask
   endclass : axi3_out_of_order_rid_seq
 
+  //============================================================================
+  // TC-21: axi3_in_order_same_id_seq (Spec A8.1 - Transaction IDs & Interleaving)
+  //============================================================================
   //============================================================================
   // TC-21: axi3_in_order_same_id_seq (Spec A8.1 - Transaction IDs & Interleaving)
   //============================================================================
@@ -1220,32 +1332,87 @@ endclass : axi3_wdata_before_addr_seq
     endfunction
 
     virtual task body();
-      bit [ID_WIDTH-1:0] test_id = 4'h5;
+      bit [ID_WIDTH-1:0]   test_id;
+      bit [LEN_WIDTH-1:0]  burst_len[5];
+      bit [SIZE_WIDTH-1:0] burst_size[5];
+      bit [DATA_WIDTH-1:0] exp_wdata[5][];
+      int                  wr_done_order[$];
+      int                  rd_done_order[$];
+
+      test_id = 4'h5;
       `uvm_info(get_type_name(), "Starting TC-21 In-Order Same-ID FIFO Retirement Test...", UVM_LOW)
 
+      // Randomize distinct burst length (1..16 beats) and size (0..default_size) per transaction
       for (int i = 0; i < 5; i++) begin
-        write_burst(
-          .id(test_id),
-          .addr(16'h2000 + (i * 16'h0040)),
-          .len(4'd3),
-          .size(default_size),
-          .burst(BURST_INCR),
-          .base_data(32'hC000_0000 | (i << 12))
-        );
+        burst_len[i]  = $urandom_range(15, 0);
+        burst_size[i] = $urandom_range(default_size, 0);
       end
 
+      // 1. Issue 5 back-to-back write bursts with identical AWID (4'h5)
       for (int i = 0; i < 5; i++) begin
-        read_burst(
-          .id(test_id),
-          .addr(16'h2000 + (i * 16'h0040)),
-          .len(4'd3),
-          .size(default_size),
-          .burst(BURST_INCR)
-        );
+        automatic int idx = i;
+        fork
+          begin
+            axi_resp_e           bresp_tmp;
+            bit [DATA_WIDTH-1:0] wdata_tmp[];
+
+            write_burst_ext(
+              .id(test_id),
+              .addr(16'h2000 + (idx * 16'h0080)),
+              .len(burst_len[idx]),
+              .size(burst_size[idx]),
+              .burst(BURST_INCR),
+              .lock(2'b00),
+              .base_data(32'hC000_0000 | (idx << 12)),
+              .bresp_out(bresp_tmp),
+              .wdata_out(wdata_tmp)
+            );
+
+            exp_wdata[idx] = wdata_tmp;
+            wr_done_order.push_back(idx);
+
+            if (bresp_tmp != RESP_OKAY) begin
+              `uvm_error(get_type_name(), $sformatf(
+                "Write %0d (ID=0x%0h, LEN=%0d, SIZE=%0d) BRESP=%0p",
+                idx, test_id, burst_len[idx], burst_size[idx], bresp_tmp))
+            end
+          end
+        join_none
       end
+      wait fork;
+
+      // 2. Issue 5 back-to-back read bursts with identical ARID (4'h5)
+      for (int i = 0; i < 5; i++) begin
+        automatic int idx = i;
+        fork
+          begin
+            axi_resp_e           rresp_out[];
+            bit [DATA_WIDTH-1:0] rdata_out[];
+
+            read_burst_ext(
+              .id(test_id),
+              .addr(16'h2000 + (idx * 16'h0080)),
+              .len(burst_len[idx]),
+              .size(burst_size[idx]),
+              .burst(BURST_INCR),
+              .lock(2'b00),
+              .rresp_out(rresp_out),
+              .rdata_out(rdata_out)
+            );
+
+            rd_done_order.push_back(idx);
+
+            if (rdata_out.size() != (burst_len[idx] + 1)) begin
+              `uvm_error(get_type_name(), $sformatf(
+                "Read %0d (LEN=%0d): Expected %0d beats, got %0d",
+                idx, burst_len[idx], burst_len[idx] + 1, rdata_out.size()))
+            end
+          end
+        join_none
+      end
+      wait fork;
     endtask
   endclass : axi3_in_order_same_id_seq
-
   //============================================================================
   // TC-23: axi3_excl_failure_seq (Spec A7.1 - Atomic & Cache/Protection Operations)
   //============================================================================
